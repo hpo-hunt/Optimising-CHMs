@@ -1,0 +1,138 @@
+---
+title: "CHM NDVI filter"
+output:
+  pdf_document: default
+  html_notebook: default
+  word_document: default
+Author: Hugo Hunt
+Date of last revision: 05/08/2024
+---
+
+Firstly, clear the work environment.
+```{r}
+rm(list=ls())
+wd <- getwd()
+```
+The working directory is by default the location of this markdown file, so does not need to be changed. 
+
+Import the required libraries for this tool
+```{r}
+library(terra)
+library(ggplot2)
+library(gdalraster)
+library(sf)
+library(tmap)
+library(rgl)
+library(raster)
+library(lidR)
+library(readxl)
+library(magick)
+library(ggplot2)
+library(gifski)
+library(magick)
+library(RColorBrewer)
+library(dplyr)
+library(reshape2)
+```
+
+Define locations and file names of the downloaded LiDAR files and Infrared Imagery.
+Import the DSM and DTM files as rasters using the rast() function. Calculate the chm by subtracting dtm from dsm
+```{r}
+dsm_file <- paste0(wd,"/data/NY30NELIDAR/england-dsm-fr-1m_5500023/ny/ny30ne_fz_dsm_1m.tif")
+dtm_file <- paste0(wd,"/data/NY30NELIDAR/england-dtm-1m_5500024/ny/ny30ne_dtm_1m.tif")
+ir_file <- paste0(wd, "/data/NY30NELIDAR/IR/NY30neIR.tif")
+
+dsm <- rast(dsm_file)
+dtm <- rast(dtm_file)
+chm <- dsm - dtm
+```
+
+
+Create a new variable, "chmpos". Define it as all the non-negative canopy heights. I.e all canopy heights less than 0 are set to 0.
+```{r}
+chmpos<-chm
+chmpos[chm<0]<-0
+plot(chmpos, main="NY30ne non-negative CHM",breaks = c(1, 3, 16, 48))
+#hist(chmpos[],main=NULL, breaks = 20, xlim = c(3, 40), ylim = c(0, 1000000))
+```
+Optionally, the CHM can be plotted over a hillshade of the terrain (DTM). The Canopy heights are classified into scrub (1-3m) and trees (>3m)
+```{r}
+slope <- terrain(dtm, "slope", unit="radians")
+aspect <- terrain(dtm, "aspect", unit="radians")
+hill <- shade(slope, aspect, 45, 270)
+plot(hill, col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2), xlim = c(337900, 338200), ylim = c(507700, 508000), main="NY30ne DSM Hillshade with CHM overlaid")
+plot(chmpos, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add=TRUE, breaks = c(1, 3, 48))
+```
+
+Rasterise the Near-Infrared band (the first band/layer) and the Red band (second band/layer) of the Colour IR data
+Since the IR data has a 50cm resolution, decrease resolution from 50cm by factor of 2 to match LiDAR data resoltion of 1m, using the aggregate function. This is less computationally expensive than continuing the analysis and aggregating later in the process.
+We can then plot them, with a custom monochrome colour scale for the Red. 
+```{r}
+IR50 <- rast(ir_file, lyrs=1)
+Red <- rast(ir_file,lyrs=2)
+IR1 <- aggregate(IR50, fact=2, fun=mean, expand=TRUE)
+Red1<-aggregate(Red, fact=2, fun=mean, expand=TRUE)
+
+Redcolours <- colorRampPalette(c("#FFFFFF80", "#FF000080"))(100)
+plot(hill, col=grey(0:100/100), legend=FALSE, main="NY30ne Red", mar=c(2,2,2,2))
+plot(Red1, col=Redcolours, add=TRUE)
+
+plot(hill, col=grey(0:100/100), legend=FALSE, main="NY30ne IR", mar=c(2,2,2,2))
+plot(IR1, col=rainbow(50,alpha=0.5, start=0.2), add=TRUE)
+```
+
+Create a function to determine NDVI fora given input of near infrared and red band data
+```{r}
+calculate_ndvi <- function(nir, red) {
+  ndvi <- (nir - red) / (nir + red)
+  return(ndvi)
+}
+```
+
+Calculate the NDVI for NY30ne using the aggregated data
+```{r}
+ndvi <- calculate_ndvi(IR1, Red1)
+plot(hill, col=grey(0:100/100), legend=FALSE, main="NY30ne NDVI", mar=c(2,2,2,2))
+plot(ndvi, col=rainbow(50,alpha=0.5, start=0.2), add=TRUE)
+```
+
+Input desired threshold value
+```{r}
+threshold <- 0.18
+chmfilt<-chmpos
+chmfilt[ndvi < threshold] <- 0
+
+```
+
+```{r}
+xfocus <- 335400 #337500
+yfocus <- 506800 #506000
+radius <- 200
+xlower <- xfocus - radius
+xupper <- xfocus + radius
+ylower <- yfocus - radius
+yupper <- yfocus + radius
+
+```
+
+To help visualise effect of NDVI Threshold value, we can plot the CHM for for the current threshold and unfiltered.
+```{r}
+  #first plot the DTM hillshade, with optional limits
+  plot(hill, main=paste("Unfiltered CHM"), 
+       #plot(hill, main=paste("Filtered CHM with threshold",threshold),
+       #optional defining of axes to focus on a specific part of the tile
+       xlim = c(xlower, xupper), ylim = c(ylower, yupper), 
+       col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2))
+  #Then plot CHM, with no transparency and the same classification as previously 
+  plot(chmpos, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add = TRUE, breaks = c(1, 3, 48))
+  
+  plot(hill, main=paste("Filtered CHM with threshold",threshold),
+       #plot(hill, main=paste("Filtered CHM with threshold",threshold),
+       #optional defining of axes to focus on a specific part of the tile
+       xlim = c(xlower, xupper), ylim = c(ylower, yupper),  
+       col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2))
+  #Then plot CHM, with no transparency and the same classification as previously 
+  plot(chmfilt, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add = TRUE, breaks = c(1, 3, 48))
+
+```
+

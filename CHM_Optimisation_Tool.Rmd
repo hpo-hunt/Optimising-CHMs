@@ -1,0 +1,484 @@
+---
+title: "CHM Optimisation Tool"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+Author: Hugo Hunt
+Date of last revision: 22/07/2024
+---
+
+Firstly, clear the work environment.
+```{r}
+rm(list=ls())
+wd <- getwd()
+```
+The working directory is by default the location of this markdown file, so does not need to be changed. 
+
+Import the required libraries for this tool
+```{r}
+library(terra)
+library(ggplot2)
+library(gdalraster)
+library(sf)
+library(tmap)
+library(rgl)
+library(raster)
+library(lidR)
+library(readxl)
+library(magick)
+library(ggplot2)
+library(gifski)
+library(magick)
+library(RColorBrewer)
+library(dplyr)
+library(reshape2)
+library(emmeans)
+library(pROC)
+library(pracma)
+```
+
+Define locations and file names of the downloaded LiDAR files and Infrared Imagery.
+Import the DSM and DTM files as rasters using the rast() function. Calculate the chm by subtracting dtm from dsm
+```{r}
+dsm_file <- paste0(wd,"/data/NY30NELIDAR/england-dsm-fr-1m_5500023/ny/ny30ne_fz_dsm_1m.tif")
+dtm_file <- paste0(wd,"/data/NY30NELIDAR/england-dtm-1m_5500024/ny/ny30ne_dtm_1m.tif")
+ir_file <- paste0(wd, "/data/NY30NELIDAR/IR/NY30neIR.tif")
+
+dsm <- rast(dsm_file)
+dtm <- rast(dtm_file)
+chm <- dsm - dtm
+```
+Calculate hillshades for DTM and DSM for plotting.
+```{r}
+slope <- terrain(dtm, "slope", unit="radians")
+aspect <- terrain(dtm, "aspect", unit="radians")
+hill <- shade(slope, aspect, 45, 270)
+
+slopedsm <- terrain(dsm, "slope", unit="radians")
+aspectdsm <- terrain(dsm, "aspect", unit="radians")
+hilldsm <- shade(slopedsm, aspectdsm, 45, 270)
+
+slopec <- terrain(chm, "slope", unit="radians")
+aspectc <- terrain(chm, "aspect", unit="radians")
+hillc <- shade(slopec, aspectc, 45, 270)
+
+```
+Plot DTM and DSM hillshades
+```{r}
+plot(hill, col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2), 
+     #xlim = c(337900, 338200), ylim = c(507700, 508000), 
+     main="NY30ne DTM Hillshade")
+plot(hilldsm, col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2), 
+     #xlim = c(337900, 338200), ylim = c(507700, 508000), 
+     main="NY30ne DSM Hillshade")
+plot(hillc, col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2), 
+     #xlim = c(337900, 338200), ylim = c(507700, 508000), 
+     main="NY30ne CHM Hillshade")
+```
+
+
+Create a new variable, "chmpos". Define it as all the non-negative canopy heights. I.e all canopy heights less than 0 are set to 0.
+```{r}
+chmpos<-chm
+chmpos[chm<0]<-0
+plot(chmpos, main="NY30ne non-negative CHM",breaks = c(1, 3, 16, 48))
+#hist(chmpos[],main=NULL, breaks = 20, xlim = c(3, 40), ylim = c(0, 1000000))
+```
+Optionally, the CHM can be plotted over a hillshade of the terrain (DTM). The Canopy heights are classified into scrub (1-3m) and trees (>3m)
+```{r}
+plot(hill, col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2), 
+     #xlim = c(337900, 338200), ylim = c(507700, 508000), 
+     main="NY30ne DTM Hillshade with CHM overlaid")
+plot(chmpos, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add=TRUE, 
+     breaks = c(1, 3, 48)
+    )
+```
+
+Rasterise the Near-Infrared band (the first band/layer) and the Red band (second band/layer) of the Colour IR data
+Since the IR data has a 50cm resolution, decrease resolution from 50cm by factor of 2 to match LiDAR data resoltion of 1m, using the aggregate function. This is less computationally expensive than continuing the analysis and aggregating later in the process.
+We can then plot them, with a custom monochrome colour scale for the Red. 
+```{r}
+IR50 <- rast(ir_file, lyrs=1)
+Red <- rast(ir_file,lyrs=2)
+IR1 <- aggregate(IR50, fact=2, fun=mean, expand=TRUE)
+Red1<-aggregate(Red, fact=2, fun=mean, expand=TRUE)
+
+Redcolours <- colorRampPalette(c("#FFFFFF80", "#FF000080"))(100)
+plot(hill, col=grey(0:100/100), legend=FALSE, main="NY30ne Red", mar=c(2,2,2,2))
+plot(Red1, col=Redcolours, add=TRUE)
+
+plot(hill, col=grey(0:100/100), legend=FALSE, main="NY30ne IR", mar=c(2,2,2,2))
+plot(IR1, col=rainbow(50,alpha=0.5, start=0.2), add=TRUE)
+```
+
+Create a function to determine NDVI fora given input of near infrared and red band data
+```{r}
+calculate_ndvi <- function(nir, red) {
+  ndvi <- (nir - red) / (nir + red)
+  return(ndvi)
+}
+```
+
+Calculate the NDVI for NY30ne using the aggregated data
+```{r}
+ndvi <- calculate_ndvi(IR1, Red1)
+plot(hill, col=grey(0:100/100), legend=FALSE, main="NY30ne NDVI", mar=c(2,2,2,2))
+plot(ndvi, col=rainbow(50,alpha=0.5, start=0.2), add=TRUE)
+```
+
+-----------
+
+We will now assess the accuracy of using NDVI as a filter for varying index thresholds.
+
+First we Create a new filtered CHM. To begin with we define it as the positive Canopy Height Model, chmpos. Determine the resolution to translate coordinates to raster position and vice-versa
+```{r}
+chmfilt<-chmpos
+resolution <- res(chmfilt)
+```
+
+Secondly, we define a function for creating a 7x7 matrix of coordinates around a given focal cell. This is to mitigate the GPS error when gathering reference data against which we will assess the model. The input is the coordiantes of the focus cell at 4,4
+```{r}
+get_adjacent_coords <- function(easting, northing, resolution) {
+  # Define the window of adjacent cells (7x7 window)
+  offsets <- expand.grid(x = -3:3, y = -3:3)
+  adjacent_coords <- cbind(easting + offsets$x * resolution[1], northing + offsets$y * resolution[2])
+  return(adjacent_coords)
+}
+```
+
+Import the reference data. treedata is made up of veteran and ancient tree data. Vegetation absence data (dswdata) is made up of dry stone wall, scree, open water, boulder, and cliff datapoints
+```{r}
+treetrainingdata <- paste0(wd,"/data/training_data_coords_large.xlsx")
+treedata <- read_excel(treetrainingdata, sheet = "xy")
+numrowst <- nrow(treedata)-1
+
+dswtrainingdata <- paste0(wd,"/data/training_data_DSW.xlsx")
+dswdata<- read_excel(dswtrainingdata,sheet = "xy")
+numrowsdsw <- nrow(dswdata)-1
+```
+
+Now we will define the sequence for the subsequent loop to test different NDVI thresholds. The start, end, and interval can all be adapted as necessary
+ 
+```{r}
+start <- -0.4
+end <- 0.6
+range <- end-start
+interval <- 0.01
+numsteps <- 1+(range+interval)/interval
+sequence <- seq(from = start, to=end, by = interval)
+```
+
+Create blank matrices that will become populated with accuracy of each different threshold, for veg absence and veg presence
+```{r}
+treeaccuracy <- matrix(NA,nrow=numrowst+1,ncol=numsteps+1)
+dswaccuracy <- matrix(NA,nrow=numrowsdsw+1,ncol=numsteps+1) 
+percentageaccuracy <- matrix(NA,nrow=numsteps,6)
+```
+
+The loop. Each cycle of the loop, the NDVI threshold increases within the predefined sequence. Anything pixel (i.e 1m^2) with a NDVI value below that threshold has the corresponding canopy height value set to 0. This filtered CHM is then compared against reference data for vegetation absence and vegetation presence. The "i"for loop cycles through every row of the tree reference data, and looks to see if the filtered CHM correctly models a tree (>3m tall) within any of the nearby cells. THis is to account for gps accuracy.  
+```{r}
+ln=0
+#loop through thresholds
+for (j in sequence) {
+  
+  ln = ln+1
+  #reset the chmfilt (not technically necessary since threshold always increasing)
+  chmfilt<-chmpos
+  threshold <- j
+  #set current loop value j as the threshold, and then use it as a filter to set any CHM values to zero where NDVI is less than threshold
+  chmfilt[ndvi < threshold] <- 0 
+  #put threshold in the first row of the relevant column
+  treeaccuracy[1,ln] <- threshold
+  dswaccuracy[1,ln] <- threshold
+  
+  #loop through each row in training data, and compare with the Filtered CHM values
+   
+  for (i in 2:nrow(treedata)) {
+    current_row <- treedata[i, ]
+    #print(current_row)
+    easting <-  current_row$Eastings
+    northing <- current_row$Northings
+    refheight <- current_row$height
+    # Generate adjacent coordinates using predefined function
+    adjacent_coords <- get_adjacent_coords(easting, northing, resolution)
+    # Extract the raster values at each of the coordinates in the nearby cells
+    raster_values <- extract(chmfilt, adjacent_coords)[,1] 
+    #value of focal cell (for vegabsence comparison)
+    coords <- cbind(easting, northing)
+    raster_value <- extract(chmfilt, coords)[,1]
+    
+
+    result <- any(raster_values > 3)
+    treeaccuracy[i,ln] <- result
+ 
+    
+
+  }
+  #caluclate the percentage accuracy of the NDVI threshold by calculating the percentage of reference data points correctly modelled.
+  averaget <- mean(treeaccuracy[2:nrow(treeaccuracy),ln])*100  
+  percentageaccuracy[ln,2] <- averaget
+  percentageaccuracy[ln,1] <- threshold
+  
+  #repeat loop but for vegetation absence
+  for (i in 2:nrow(dswdata)) {
+    current_row <- dswdata[i, ]
+    #print(current_row)
+    easting <-  current_row$Eastings
+    northing <- current_row$Northings
+    refheight <- current_row$height
+    
+    #value of cell
+    coords <- cbind(easting, northing)
+    raster_value <- extract(chmfilt, coords)[,1]
+    
+    if (refheight==0){
+      result <- any(raster_value < 1)
+      dswaccuracy[i,ln] <- result
+    } else {
+      dswaccuracy[i,ln] <- 0
+    }
+    
+  }
+  averagedsw <- mean(dswaccuracy[2:nrow(dswaccuracy),ln])*100
+  percentageaccuracy[ln,3] <- averagedsw
+  percentageaccuracy[ln,4] <- 0.5*(averaget+averagedsw)
+
+}
+```
+
+Plot the results using ggplot2
+```{r}
+y_range <- range(c(percentageaccuracy[, 2], percentageaccuracy[, 3])) 
+
+# Create a data frame from accuracy matrix
+percentageaccuracy_df <- as.data.frame(percentageaccuracy)
+
+# Rename columns
+names(percentageaccuracy_df) <- c("NDVI_Threshold", "Veg_Pres_Accuracy", "veg_abs_Accuracy", "Combined_Accuracy", "TPR", "FPR")
+
+# Manually reshape the data frame to long format
+percentageaccuracy_long <- data.frame(
+  NDVI_Threshold = rep(percentageaccuracy_df$NDVI_Threshold, 3),
+  Accuracy = c(percentageaccuracy_df$Veg_Pres_Accuracy, percentageaccuracy_df$veg_abs_Accuracy, percentageaccuracy_df$Combined_Accuracy),
+  Accuracy_Type = factor(rep(c("Vegetation Presence", "Vegetation Absence", "Combined Accuracy"), each = nrow(percentageaccuracy_df)))
+)
+# Create the plot using ggplot2
+ggplot(data = percentageaccuracy_long, aes(x = NDVI_Threshold, y = Accuracy, color = Accuracy_Type)) +
+  geom_point() +
+  geom_line () +
+  #geom_smooth(method = "loess", se = FALSE, span=0.5) + 
+  labs(x = "NDVI Threshold", 
+       y = "Percentage Accuracy", 
+       title = "Model accuracy for varying NDVI threshold") +
+  ylim(y_range) + 
+  theme_minimal()
+
+##plot again but focus on area of interest
+ggplot(data = percentageaccuracy_long, aes(x = NDVI_Threshold, y = Accuracy, color = Accuracy_Type)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, span=0.5) + 
+  labs(x = "NDVI Threshold", 
+       y = "Percentage Accuracy", 
+       title = "Model accuracy for varying NDVI threshold") +
+  ylim(y_range) + xlim(0.09,0.31) +
+  theme_minimal()
+
+
+
+```
+
+Calculate the TPR and FPR manually to plot a ROC curve
+```{r}
+#Calculate TPR
+percentageaccuracy[,5] <- (percentageaccuracy[,2]/100
+                           #/(percentageaccuracy[,2]-percentageaccuracy[,2]+1)
+                          )
+#Calucalate FPR 
+percentageaccuracy[,6] <- (1-(percentageaccuracy[,3]/100)
+                           #/(1-percentageaccuracy[,3]-percentageaccuracy[,3]+1)
+                           )
+#remove last row and create new matrix, and reverse order or rows so that x is in increasing direction
+TPRFPR <- percentageaccuracy[-nrow(percentageaccuracy),5:6]
+tprfpr <- TPRFPR[nrow(TPRFPR):1, ]
+#areaundercurve - note this does not extend to FPR =1
+areauc <- trapz(tprfpr[,2],tprfpr[,1])
+#additional computation of AUC for comparison
+auc_manual <- sum(diff(tprfpr[,2]) * (head(tprfpr[,1], -1) + tail(tprfpr[,1], -1)) / 2)
+
+#extrapolation
+extraprow <- c(tprfpr[nrow(tprfpr), 1],1) 
+fullROC <- rbind(tprfpr,extraprow)
+#area under the extrapolated curve using the trapezoidal method of integrating
+AUCextrap <- trapz(fullROC[,2],fullROC[,1])
+auc_manual_extrap <- sum(diff(fullROC[,2]) * (head(fullROC[,1], -1) + tail(fullROC[,1], -1)) / 2)
+print(paste("Area under extrapolated Curve:",auc_manual_extrap))
+
+ROCdf <- as.data.frame(TPRFPR)
+
+#calculate closest point to (0,1)
+distances <- sqrt((percentageaccuracy[,6] - 0)^2 + (percentageaccuracy[,5] - 1)^2)
+min_index <- which.min(distances)
+
+# Output the closest coordinate and its distance
+closest_point_thresh <- percentageaccuracy[min_index, 1]
+closest_point_TPR <- percentageaccuracy[min_index,5]
+closest_point_FPR <- percentageaccuracy[min_index,6]
+closest_distance <- distances[min_index]
+
+#Now plot the ROC, with the closest point illustrated and the extrapolated point highlighted in Red
+ROCdf$PointType <- "Modelled Data"
+ymax <- ROCdf[1, "V1"]
+extrap_point <- data.frame(V1 = ymax, V2 = 1, PointType = "Extrapolated Point")
+closest_point <- data.frame(V1 = closest_point_TPR, V2 = closest_point_FPR, PointType = "Closest Point")
+ROCdf_full_plot <- rbind(ROCdf, extrap_point, closest_point)
+
+ggplot(ROCdf_full_plot, aes(x = V2, y = V1, color = PointType)) +
+  geom_point() + 
+  geom_point(aes(x = 0, y = 1, color = "Closest Point")) +
+  geom_line(data = ROCdf, aes(x = V2, y = V1, color = "Modelled Data")) + # Modelled data line
+  geom_segment(aes(x = ROCdf[1, "V2"], y = ROCdf[1, "V1"], 
+                   xend = 1, yend = ymax, color = "Modelled Data")) + # Segment for extrapolation
+  geom_segment(aes(x = 0, y = 1, 
+                   xend = closest_point_FPR, yend = closest_point_TPR, color = "Closest Point")) + # Closest point line
+  labs(x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)", 
+       title = paste("Area Under Curve:", signif(auc_manual_extrap, 3))) +
+  coord_fixed(ratio = 1) +
+  ylim(0,1) + xlim(0,1) +
+  scale_color_manual(name = "Point Type",
+                     values = c("Modelled Data" = "black", 
+                                "Extrapolated Point" = "red", 
+                                "Closest Point" = "blue"),
+                     labels = c("Modelled Data" = "Modelled Data Points", 
+                                "Extrapolated Point" = "Extrapolated Point", 
+                                "Closest Point" = "Closest Point")) +
+  theme_minimal() 
+
+```
+
+Now we can calculate various other metrics for the model
+```{r}
+statsDF<- data.frame(
+  Thresh = percentageaccuracy[,1],
+  Sensitivity = percentageaccuracy[,2]/100,
+  Specificity = percentageaccuracy[,3]/100,
+  Precision = percentageaccuracy[,2]/(100+percentageaccuracy[,2]-percentageaccuracy[,3]),
+  Accuracy = percentageaccuracy[,4]/100
+)
+correlations <- cor(statsDF)
+print(correlations)
+
+metrics_long <- melt(statsDF, id.vars = "Thresh", measure.vars = c("Accuracy", "Sensitivity", "Specificity", "Precision"))
+colnames(metrics_long) <- c("Threshold", "Metric", "Value")
+
+ggplot(metrics_long, aes(x = Threshold, y = Value, color = Metric)) +
+  geom_point() + # Add points
+  #geom_smooth(se = FALSE) + # Add smooth lines
+  geom_line () +
+  labs(x = "Threshold", y = "Value", title = "Metrics vs. Threshold") +
+  #xlim(0.145,0.165) + #optionally focus on a particular part of the graph i.e intersection point
+  #ylim(0.887,0.925) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) # Remove legend title
+
+ggsave("metrics.jpg", path = "C:/Users/hh000057/OneDrive - Defra/Migrated Data/Documents/Apprenticeship/CORC413 - MSc/Graphics for report", width = 6, height = 4, dpi = 900)
+```
+
+To help visualise effect of NDVI Threshold value, we can plot the CHM for varying NDVIs and save each one as a png.
+```{r}
+#define sequence for thresholds for the for loop
+debut <- -0.4
+fin <- 0.5
+increment <- 0.05
+ndviseq <- seq(from = debut, to=fin, by = increment)
+nint = 1+(fin-debut)/increment
+for (x in ndviseq) {
+  chmfilt <- chmpos
+  chmfilt[ndvi < x] <- 0
+  name <- paste0("chmfilt",x)
+  assign(name,chmfilt)
+  outputfolder<- "C:/Users/hh000057/OneDrive - Defra/Migrated Data/Documents/Apprenticeship/CORC409 - Postgraduate Research Methods/RStuff/GIF"
+  file_name <- paste0("chmfilt",x,".png")
+  file_path <- file.path(outputfolder, file_name)
+  png(file_path,width =700, height=600)
+  #first plot the DTM hillshade, with optional limits
+  plot(hill, main=paste("Filtered CHM with threshold",x), 
+       #optional defining of axes to focus on a specific part of the tile
+       xlim = c(337900, 338200), ylim = c(507700, 508000), 
+       col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2))
+  #Then plot CHM, with no transparency and the same classification as above. 
+  plot(chmfilt, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add = TRUE, breaks = c(1, 3, 48))
+  dev.off()
+}
+#also create and save an unfiltered one to add to the beginning of the sequence with a different title. Start file name with 0 so that it gets read in first in the animation making code in the next chunk.
+file_name <- paste0("0","Unfiltered",".png")
+file_path <- file.path(outputfolder, file_name)
+png(file_path,width =700, height=600)
+  #first plot the DTM hillshade, with optional limits
+  plot(hill, main="Unfiltered CHM", 
+       #optional defining of axes to focus on a specific part of the tile
+       #xlim = c(337900, 338200), ylim = c(507700, 508000), 
+       col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2))
+  #Then plot the positive CHM, with no transparency and the same classification as above. 
+  plot(chmpos, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add = TRUE, breaks = c(1, 3, 48))
+  dev.off()
+```
+
+Now we can create an animation of the plots saved above, by using the magick package to create a gif. Manually rename the files before this step to make sure than negative numerical filters come before the positive ones.
+```{r}
+png_dir <- "C:/Users/hh000057/OneDrive - Defra/Migrated Data/Documents/Apprenticeship/CORC409 - Postgraduate Research Methods/RStuff/GIF"
+
+# List all PNG files in the GIF folder, and read the images
+png_files <- list.files(path = png_dir, pattern = "*.png", full.names = TRUE)
+images <- image_read(png_files)
+
+# Create an animated GIF
+animated_gif <- image_animate(images, fps = 2)  # Adjust fps (frames per second) as needed
+
+# Define the output file path for the GIF
+gif_path <- file.path(png_dir, "CHMfilt_animation.gif")
+# Save the GIF
+image_write(animated_gif, gif_path)
+```
+
+
+For poster presentation, replotting some frames at high resolution
+```{r}
+t <- 0.18
+chmfilt <- chmpos
+  chmfilt[ndvi < t] <- 0
+  name <- paste0("CHMfilt",t)
+  assign(name,chmfilt)
+  outputfolder<- "C:/Users/hh000057/OneDrive - Defra/Migrated Data/Documents/Apprenticeship/CORC409 - Postgraduate Research Methods/RStuff/GIF/Poster"
+  file_name <- paste0("chmfilt",t,".png")
+  file_path <- file.path(outputfolder, file_name)
+  png(file_path,width =1200, height=1000, res = 200)
+  #first plot the DTM hillshade, with optional limits
+  plot(hill, main=paste("Filtered CHM with threshold",t), 
+       #optional defining of axes to focus on a specific part of the tile
+       xlim = c(337900, 338200), ylim = c(507700, 508000), 
+       col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2))
+  #Then plot CHM, with no transparency and the same classification as above. 
+  plot(chmfilt, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add = TRUE, breaks = c(1, 3, 48))
+  dev.off()
+```
+
+Now the unfiltered CHM plot
+```{r}
+chmfilt <- chmpos
+#  name <- paste0("CHMfilt",t)
+#  assign(name,chmfilt)
+  outputfolder<- "C:/Users/hh000057/OneDrive - Defra/Migrated Data/Documents/Apprenticeship/CORC409 - Postgraduate Research Methods/RStuff/GIF/Poster"
+  file_name <- paste0("Unfilteredchm.png")
+  file_path <- file.path(outputfolder, file_name)
+  png(file_path,width =1200, height=1000, res = 200)
+  #first plot the DTM hillshade, with optional limits
+  plot(hill, main="Unfiltered CHM", 
+       #optional defining of axes to focus on a specific part of the tile
+       xlim = c(337900, 338200), ylim = c(507700, 508000), 
+       col=grey(0:100/100), legend=FALSE, mar=c(2,2,2,2))
+  #Then plot CHM, with no transparency and the same classification as above. 
+  plot(chmfilt, col=rainbow(10,alpha=1,rev=TRUE, end = 1- max(1, 10 - 1)/10, start = 0.6), add = TRUE, breaks = c(1, 3, 48))
+  dev.off()
+```
+
