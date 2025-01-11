@@ -1,0 +1,89 @@
+---
+title: "PointCloud Processing Notebook"
+output:
+  word_document: default
+  html_notebook: default
+date: "05/08/2024"
+---
+
+clear workspace and load libraries
+```{r Libraries}
+rm(list=ls())
+library(lidR)
+library(ggplot2)
+library(RCSF)
+library(gstat)
+library(rgl)
+library(magick)
+```
+
+Read in specified LAS file data. Note, a 5x5km tile is very heavy and may take significant time to process. Depending on the workstation it may crash R when plotting. For illustration, a 1x1km tile is used instead. 
+```{r LAS_import}
+#specify point cloud filename
+laz_file <- "data/england-laz-2009_5499952/ny/ny3506_p_6854_20091208_20091218.laz"
+#read laz file, filtering for first returns only.
+lasfz <- readLAS(laz_file,filter= "-keep_first")
+```
+
+Now we can plot the pointcloud in 3d. We can interact with the plot usingf the mouse, or set it to spin at a defined speedm which we then save to a specified directory within the Wd.
+```{r 3Dplot}
+p <- plot(lasfz, bg="black", axis = TRUE, legend = TRUE, breaks = "quantile")
+#play3d(spin3d())
+directory<-"GIF"
+#movie3d(spin3d(axis = c(0,0,1), rpm = 8), duration = 8, fps = 20, dir = output_dir,movie = "NabScarSpin")
+```
+
+Here we can set another spinning 3D plot, but zoomed in with a slow rotation so that individual points can be seen in contenxt
+```{r Demo}
+p <- plot(lasfz, bg="black", axis = TRUE, legend = TRUE, breaks = "quantile")
+rgl.viewpoint(theta = 0, phi = -90, fov = 40, zoom = .1)
+#play3d(spin3d(axis = c(0,0,1), rpm = 0.25))
+```
+
+Performing further analysis, we can classify the vegetation using the lidR package at the filter_poi function
+
+```{r veg_classification}
+veg <- filter_poi(lasfz, Classification == LASHIGHVEGETATION)
+nonveg <- filter_poi(lasfz, Classification != LASHIGHVEGETATION)
+```
+
+Now we can plot the vegetation and non-vegetation points in different colours to differentiate them easily
+```{r PLotting_veg}
+x <- plot(nonveg, 
+          #color = "Classification", 
+          bg = "white", size = 1)
+plot(veg, add = x)
+```
+Alternative classifications
+```{r PMFclassification}
+las <- readLAS(laz_file, select = "xyzrn")
+las <- classify_ground(las, algorithm = pmf(ws = 5, th = 3))
+plot(las, color = "Classification", size = 1.5, bg = "black") 
+play3d(spin3d())
+```
+Cloth draping method of classication
+```{r ClothDraping}
+las <- readLAS(laz_file, select = "xyzrn")
+las <- classify_ground(las, algorithm = csf())
+plot(las, color = "Classification", size = 1, bg = "white")
+```
+Rasterise to create a DTM. First using TIN method
+```{r TINDTM}
+dtm_tin <- rasterize_terrain(las, res = 1, algorithm = tin())
+plot_dtm3d(dtm_tin, bg = "white") 
+```
+Finally, using the KNN IDW (K-nearest neighbour, Inverse Distance Weighting) method
+```{r NDDIDW_DTM}
+dtm_idw <- rasterize_terrain(las, 1, algorithm = knnidw(k = 10L, p = 2))
+d <- plot_dtm3d(dtm_idw, bg = "white", legend = TRUE) 
+```
+
+Finally, we can plot the DTM and overlay vegeation
+```{r DTMplot}
+v <- plot(veg, 
+          #color = "Classification", 
+          bg = "white", size = 1)
+add_dtm3d(v, dtm_idw)
+#play3d(spin3d(axis = c(0,0,1), rpm = 4))
+```
+
